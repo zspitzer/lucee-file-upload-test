@@ -1,0 +1,158 @@
+name: File Upload Tests
+
+env:
+  DEFAULT_LUCEE_VERSIONS: '[ "6.2/snapshot", "7.0/snapshot" ]'
+
+on:
+  workflow_dispatch:
+    inputs:
+      lucee_versions:
+        required: false
+        description: Lucee Versions (json)
+        default: '[ "6.2/snapshot", "7.0/snapshot" ]'
+        type: string
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  download-lucee:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.resolve.outputs.versions }}
+      lucee_versions: ${{ steps.resolve.outputs.lucee_versions }}
+    steps:
+      - name: Resolve Lucee versions
+        id: resolve
+        run: |
+          VERSIONS='${{ github.event.inputs.lucee_versions || env.DEFAULT_LUCEE_VERSIONS }}'
+          echo "lucee_versions=${VERSIONS}" >> $GITHUB_OUTPUT
+          VERSION_MAP="{}"
+
+          for version_path in $(echo "$VERSIONS" | jq -r '.[]'); do
+            MAJOR_MINOR=$(echo "$version_path" | cut -d'/' -f1)
+            RELEASE_TYPE=$(echo "$version_path" | cut -d'/' -f2)
+            LUCEE_VERSION=$(curl -s "https://update.lucee.org/rest/update/provider/latest/${MAJOR_MINOR}/${RELEASE_TYPE}/light/string" | tr -d '"')
+            echo "Resolved ${version_path} to ${LUCEE_VERSION}"
+            VERSION_MAP=$(echo "$VERSION_MAP" | jq --arg key "$version_path" --arg val "$LUCEE_VERSION" '. + {($key): $val}')
+          done
+
+          echo "versions=$(echo "$VERSION_MAP" | jq -c '.')" >> $GITHUB_OUTPUT
+
+      - name: Cache Lucee Express downloads
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: lucee-express/
+          key: lucee-express
+          enableCrossOsArchive: true
+
+      - name: Download missing Lucee Express versions
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p lucee-express
+          VERSION_MAP='${{ steps.resolve.outputs.versions }}'
+
+          for LUCEE_VERSION in $(echo "$VERSION_MAP" | jq -r '.[]' | sort -u); do
+            EXPRESS_FILE="lucee-express/lucee-express-${LUCEE_VERSION}.zip"
+            if [ ! -f "${EXPRESS_FILE}" ]; then
+              EXPRESS_URL="https://cdn.lucee.org/lucee-express-${LUCEE_VERSION}.zip"
+              echo "Downloading ${EXPRESS_URL}"
+              curl -fsSL -o "${EXPRESS_FILE}" "${EXPRESS_URL}"
+            else
+              echo "Already have ${EXPRESS_FILE}"
+            fi
+          done
+          ls -la lucee-express/
+
+  test:
+    needs: download-lucee
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        luceeVersion: ${{ fromJSON(needs.download-lucee.outputs.lucee_versions) }}
+        javaVersion: [ 21 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.javaVersion }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.javaVersion }}
+          distribution: "temurin"
+
+      - name: Restore Lucee Express cache
+        uses: actions/cache/restore@v4
+        with:
+          path: lucee-express/
+          key: lucee-express
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Get resolved version
+        id: version
+        shell: bash
+        run: |
+          VERSION_MAP='${{ needs.download-lucee.outputs.versions }}'
+          LUCEE_TEST_VERSION=$(echo "$VERSION_MAP" | jq -r '."${{ matrix.luceeVersion }}"')
+          echo "lucee_version=${LUCEE_TEST_VERSION}" >> $GITHUB_OUTPUT
+          echo "Using Lucee version: ${LUCEE_TEST_VERSION}"
+
+      - name: Extract and start Lucee Express (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          unzip -q lucee-express/lucee-express-${{ steps.version.outputs.lucee_version }}.zip -d lucee
+          cp -r test/* lucee/webapps/ROOT/
+          chmod +x lucee/bin/*.sh
+          cd lucee && ./bin/startup.sh &
+          sleep 5
+          curl http://localhost:8888/version.cfm --fail-with-body -o $GITHUB_STEP_SUMMARY
+
+      - name: Extract and start Lucee Express (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          unzip -q lucee-express/lucee-express-${{ steps.version.outputs.lucee_version }}.zip -d lucee
+          xcopy test\* lucee\webapps\ROOT\ /E /Y
+          cd lucee\bin
+          set LUCEE_ENABLE_WARMUP=true
+          call catalina.bat run
+          set LUCEE_ENABLE_WARMUP=
+          start /B startup.bat
+          powershell -command "Start-Sleep -s 5"
+          curl http://localhost:8888/version.cfm --fail-with-body -o %GITHUB_STEP_SUMMARY%
+
+      - name: Run File Upload Tests
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl http://localhost:8888/test.cfm --fail-with-body -o $GITHUB_STEP_SUMMARY
+
+      - name: Run File Upload Tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl http://localhost:8888/test.cfm --fail-with-body -o $GITHUB_STEP_SUMMARY
+
+      - name: List lucee directory
+        if: always()
+        shell: bash
+        run: |
+          ls -laR lucee/ || echo "lucee/ does not exist"
+
+      - name: Debug logs
+        if: always()
+        shell: bash
+        run: |
+          echo "------ Tomcat logs ----------"
+          for f in lucee/logs/*; do
+            [ -s "$f" ] && echo "=== $f ===" && cat "$f"
+          done || true
+          echo "------ Lucee logs ----------"
+          for f in lucee/lucee-server/context/logs/*; do
+            [ -s "$f" ] && echo "=== $f ===" && cat "$f"
+          done || true
